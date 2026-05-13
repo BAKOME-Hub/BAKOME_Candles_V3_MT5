@@ -1,0 +1,315 @@
+//+------------------------------------------------------------------+
+//|                                             BAKOME_Candles_V3.mq5|
+//|                                      BAKOME Trading Systems      |
+//|                                                       v3.00      |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2026, BAKOME-Hub"
+#property link      "https://github.com/BAKOME-Hub"
+#property version   "3.00"
+#property description "Institutional Strength & Optimization Engine"
+#property description "Trend strength, EMA crossover, ATR levels"
+
+#property indicator_chart_window
+#property indicator_buffers 6
+#property indicator_plots   4
+
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLime
+#property indicator_width1  2
+#property indicator_label1  "BUY"
+
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrRed
+#property indicator_width2  2
+#property indicator_label2  "SELL"
+
+#property indicator_type3   DRAW_LINE
+#property indicator_color3  clrDodgerBlue
+#property indicator_width3  1
+#property indicator_label3  "Strength"
+
+#property indicator_type4   DRAW_LINE
+#property indicator_color4  clrGray
+#property indicator_width4  1
+#property indicator_label4  "ATR"
+
+//+------------------------------------------------------------------+
+//| Input parameters                                                |
+//+------------------------------------------------------------------+
+input int      StrengthPeriod      = 8;
+input int      ATRPeriod           = 14;
+input int      FastEMA             = 20;
+input int      SlowEMA             = 100;
+
+input bool     EnableAlerts        = true;
+input bool     EnablePush          = true;
+input bool     EnableArrows        = true;
+input bool     EnableOptimizer     = false;   // désactivé par défaut
+
+input double   ATR_SL_Multiplier   = 1.5;
+input double   ATR_TP_Multiplier   = 3.0;
+
+input color    BullColor           = clrLime;
+input color    BearColor           = clrTomato;
+
+//+------------------------------------------------------------------+
+//| Indicator buffers                                               |
+//+------------------------------------------------------------------+
+double BuyArrowBuffer[];
+double SellArrowBuffer[];
+double StrengthBuffer[];
+double ATRBuffer[];
+
+//+------------------------------------------------------------------+
+//| Global handles                                                  |
+//+------------------------------------------------------------------+
+int atrHandle     = INVALID_HANDLE;
+int fastMAHandle  = INVALID_HANDLE;
+int slowMAHandle  = INVALID_HANDLE;
+
+datetime lastAlertTime = 0;
+
+//+------------------------------------------------------------------+
+//| Helper: get value from handle                                    |
+//+------------------------------------------------------------------+
+bool GetValueFromHandle(int handle, int shift, double &value)
+{
+   double buf[1];
+   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0)
+      return false;
+   value = buf[0];
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get ATR value (cached handle)                                   |
+//+------------------------------------------------------------------+
+double GetATR(int shift)
+{
+   double val;
+   return GetValueFromHandle(atrHandle, shift, val) ? val : 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Get EMA value (cached handle)                                    |
+//+------------------------------------------------------------------+
+double GetEMA(int handle, int shift)
+{
+   double val;
+   return GetValueFromHandle(handle, shift, val) ? val : 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate strength (cached handles)                             |
+//+------------------------------------------------------------------+
+double CalculateStrength(int shift)
+{
+   double close = iClose(_Symbol, PERIOD_CURRENT, shift);
+   double fast  = GetEMA(fastMAHandle, shift);
+   double slow  = GetEMA(slowMAHandle, shift);
+   if(fast == 0.0 || slow == 0.0) return 0.0;
+
+   double momentum = close - fast;
+   double trend    = fast - slow;
+   double strength = (momentum * 0.6) + (trend * 0.4);
+   return strength;
+}
+
+//+------------------------------------------------------------------+
+//| Detect market state                                              |
+//+------------------------------------------------------------------+
+string DetectState(double strength)
+{
+   if(strength > 100) return "BULL STRONG";
+   if(strength > 50)  return "BULL MED";
+   if(strength > 0)   return "BULL LIGHT";
+   if(strength < -100)return "BEAR STRONG";
+   if(strength < -50) return "BEAR MED";
+   if(strength < 0)   return "BEAR LIGHT";
+   return "NEUTRAL";
+}
+
+//+------------------------------------------------------------------+
+//| Signal conditions (uses cached handles)                         |
+//+------------------------------------------------------------------+
+bool BuySignal(int shift)
+{
+   double fast = GetEMA(fastMAHandle, shift);
+   double slow = GetEMA(slowMAHandle, shift);
+   double close = iClose(_Symbol, PERIOD_CURRENT, shift);
+   if(fast == 0.0 || slow == 0.0) return false;
+   return (close > fast && fast > slow);
+}
+
+bool SellSignal(int shift)
+{
+   double fast = GetEMA(fastMAHandle, shift);
+   double slow = GetEMA(slowMAHandle, shift);
+   double close = iClose(_Symbol, PERIOD_CURRENT, shift);
+   if(fast == 0.0 || slow == 0.0) return false;
+   return (close < fast && fast < slow);
+}
+
+//+------------------------------------------------------------------+
+//| Draw trade levels (only on new signal)                          |
+//+------------------------------------------------------------------+
+void DrawTradeLevels(bool isBuy, double entry, double sl, double tp, datetime time)
+{
+   string prefix = "BAKOME_" + (isBuy ? "BUY_" : "SELL_") + IntegerToString(time);
+   ObjectDelete(0, prefix + "ENTRY");
+   ObjectDelete(0, prefix + "SL");
+   ObjectDelete(0, prefix + "TP");
+
+   ObjectCreate(0, prefix + "ENTRY", OBJ_HLINE, 0, 0, entry);
+   ObjectCreate(0, prefix + "SL",    OBJ_HLINE, 0, 0, sl);
+   ObjectCreate(0, prefix + "TP",    OBJ_HLINE, 0, 0, tp);
+
+   ObjectSetInteger(0, prefix + "ENTRY", OBJPROP_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, prefix + "SL",    OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, prefix + "TP",    OBJPROP_COLOR, clrLime);
+}
+
+//+------------------------------------------------------------------+
+//| Alert trigger (once per bar)                                     |
+//+------------------------------------------------------------------+
+void TriggerAlert(string direction, double entry, double sl, double tp, datetime barTime)
+{
+   if(barTime == lastAlertTime) return;
+   lastAlertTime = barTime;
+
+   string msg = StringFormat("BAKOME SIGNAL | %s | ENTRY: %.5f | SL: %.5f | TP: %.5f",
+                              direction, entry, sl, tp);
+   if(EnableAlerts) Alert(msg);
+   if(EnablePush)   SendNotification(msg);
+}
+
+//+------------------------------------------------------------------+
+//| Initialization                                                  |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   IndicatorSetString(INDICATOR_SHORTNAME, "BAKOME Candles V3");
+
+   SetIndexBuffer(0, BuyArrowBuffer,   INDICATOR_DATA);
+   SetIndexBuffer(1, SellArrowBuffer,  INDICATOR_DATA);
+   SetIndexBuffer(2, StrengthBuffer,   INDICATOR_DATA);
+   SetIndexBuffer(3, ATRBuffer,        INDICATOR_DATA);
+
+   PlotIndexSetInteger(0, PLOT_ARROW, 233);
+   PlotIndexSetInteger(1, PLOT_ARROW, 234);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, BullColor);
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, BearColor);
+
+   // Création des handles (une seule fois)
+   atrHandle    = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+   fastMAHandle = iMA(_Symbol, PERIOD_CURRENT, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   slowMAHandle = iMA(_Symbol, PERIOD_CURRENT, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(atrHandle == INVALID_HANDLE || fastMAHandle == INVALID_HANDLE || slowMAHandle == INVALID_HANDLE)
+   {
+      Print("Erreur création des indicateurs");
+      return INIT_FAILED;
+   }
+
+   // S'assurer que les buffers sont en séries
+   ArraySetAsSeries(BuyArrowBuffer, true);
+   ArraySetAsSeries(SellArrowBuffer, true);
+   ArraySetAsSeries(StrengthBuffer, true);
+   ArraySetAsSeries(ATRBuffer, true);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization                                                |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(atrHandle    != INVALID_HANDLE) IndicatorRelease(atrHandle);
+   if(fastMAHandle != INVALID_HANDLE) IndicatorRelease(fastMAHandle);
+   if(slowMAHandle != INVALID_HANDLE) IndicatorRelease(slowMAHandle);
+   ObjectsDeleteAll(0, "BAKOME_");
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| Main calculation                                                |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   if(rates_total < 100) return 0;
+
+   int start = (prev_calculated > 200) ? prev_calculated - 200 : 1;
+   if(start < 1) start = 1;
+
+   static int buyCount = 0, sellCount = 0;
+
+   for(int i = start; i < rates_total; i++)
+   {
+      double atr = GetATR(i);
+      double strength = CalculateStrength(i);
+      string state = DetectState(strength);
+
+      StrengthBuffer[i] = strength;
+      ATRBuffer[i] = atr;
+
+      BuyArrowBuffer[i] = EMPTY_VALUE;
+      SellArrowBuffer[i] = EMPTY_VALUE;
+
+      if(BuySignal(i))
+      {
+         if(EnableArrows)
+            BuyArrowBuffer[i] = low[i] - (atr * 0.5);
+
+         double entry = close[i];
+         double sl = entry - (atr * ATR_SL_Multiplier);
+         double tp = entry + (atr * ATR_TP_Multiplier);
+
+         if(i == rates_total - 1)   // dernière barre fermée
+         {
+            DrawTradeLevels(true, entry, sl, tp, time[i]);
+            TriggerAlert("BUY", entry, sl, tp, time[i]);
+         }
+         buyCount++;
+      }
+      else if(SellSignal(i))
+      {
+         if(EnableArrows)
+            SellArrowBuffer[i] = high[i] + (atr * 0.5);
+
+         double entry = close[i];
+         double sl = entry + (atr * ATR_SL_Multiplier);
+         double tp = entry - (atr * ATR_TP_Multiplier);
+
+         if(i == rates_total - 1)
+         {
+            DrawTradeLevels(false, entry, sl, tp, time[i]);
+            TriggerAlert("SELL", entry, sl, tp, time[i]);
+         }
+         sellCount++;
+      }
+   }
+
+   // Dashboard (sans optimizer factice)
+   string dashboard = "";
+   dashboard += "BAKOME Candles V3\n";
+   dashboard += "====================\n";
+   dashboard += "State: " + DetectState(StrengthBuffer[rates_total-1]) + "\n";
+   dashboard += "ATR: " + DoubleToString(ATRBuffer[rates_total-1], 2) + "\n";
+   dashboard += "BUY Signals: " + IntegerToString(buyCount) + "\n";
+   dashboard += "SELL Signals: " + IntegerToString(sellCount) + "\n";
+   dashboard += "Status: RUNNING";
+   Comment(dashboard);
+
+   return rates_total;
+}
+//+------------------------------------------------------------------+
